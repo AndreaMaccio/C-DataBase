@@ -19,10 +19,10 @@ void *autosave_thread(void *arg) {
       break;
     printf("[autosave] saving database...\n");
 
-    if (checkpoint_database(db, "data/dump.txt") == 0) {
-      printf("[autosave] save complete\n");
+    if (bgsave_database(db, "data/dump.txt", "data/wal.log") == 0) {
+      printf("[autosave] bgsave initiated and completed successfully\n");
     } else {
-      printf("[autosave] save failed\n");
+      printf("[autosave] bgsave failed\n");
     }
   }
   return NULL;

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static FILE *wal_fp;
@@ -98,10 +99,10 @@ void client_execute_del(hashmap_t *map, const char *key) {
   pthread_mutex_unlock(&wal_mutex);
 }
 
-int storage_replay_wal(hashmap_t *map) {
-  FILE *fp = fopen("data/wal.log", "r");
+void storage_replay_wal_file(hashmap_t *map, const char *filepath) {
+  FILE *fp = fopen(filepath, "r");
   if (!fp) {
-    return -1;
+    return;
   }
 
   char line[1024];
@@ -127,5 +128,62 @@ int storage_replay_wal(hashmap_t *map) {
     }
   }
   fclose(fp);
+}
+
+int storage_replay_wal(hashmap_t *map) {
+
+  storage_replay_wal_file(map, "data/wal.log.old");
+
+  storage_replay_wal_file(map, "data/wal.log");
+
   return 0;
+}
+
+int bgsave_database(hashmap_t *map, const char *snapshot_file,
+                    const char *wal_path) {
+  pid_t pid;
+  int status;
+  char old_wal_path[256];
+  snprintf(old_wal_path, sizeof(old_wal_path), "%s.old", wal_path);
+
+  pthread_mutex_lock(&wal_mutex);
+  pthread_mutex_lock(&map->mutex);
+
+  fclose(wal_fp);
+  rename(wal_path, old_wal_path);
+  wal_fp = fopen(wal_path, "a");
+
+  pid = fork();
+
+  if (!pid) {
+    FILE *fp = fopen("data/dump_temp.txt", "w");
+    if (!fp)
+      exit(1);
+
+    for (size_t i = 0; i < map->size; i++) {
+      entry_t *current = map->buckets[i];
+      while (current) {
+        fprintf(fp, "%s=%s\n", current->key, current->value);
+        current = current->next;
+      }
+    }
+
+    fflush(fp);
+    fsync(fileno(fp));
+    fclose(fp);
+    exit(0);
+  }
+
+  pthread_mutex_unlock(&wal_mutex);
+  pthread_mutex_unlock(&map->mutex);
+  waitpid(pid, &status, 0);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    rename("data/dump_temp.txt", snapshot_file);
+    remove(old_wal_path);
+    printf("[bgsave] Snapshot salvato in background!\n");
+    return 0;
+  } else {
+    perror("[bgsave] Errore nel salvataggio del figlio.\n");
+    return -1;
+  }
 }
