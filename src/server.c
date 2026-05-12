@@ -21,13 +21,15 @@ static void *client_handler(void *arg) {
   hashmap_t *db = args->db;
   free(args);
 
-  char buffer[BUFFER_SIZE];
+  char buffer[BUFFER_SIZE * 2];
+  memset(buffer, 0, sizeof(buffer));
+  char recv_buffer[BUFFER_SIZE];
   ssize_t bytes_received;
 
   printf("Thread client avviato\n");
 
   while (1) {
-    bytes_received = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+    bytes_received = recv(client_fd, recv_buffer, BUFFER_SIZE - 1, 0);
 
     if (bytes_received < 0) {
       perror("recv");
@@ -39,76 +41,77 @@ static void *client_handler(void *arg) {
       break;
     }
 
-    buffer[bytes_received] = '\0';
-    printf("[Client %d] %s\n", client_fd, buffer);
+    recv_buffer[bytes_received] = '\0';
+    strcat(buffer, recv_buffer);
 
-    // parsing
-    char *saveptr;
-    char *cmd = strtok_r(buffer, " \r\n", &saveptr);
+    char *newline;
 
-    if (cmd == NULL) {
-      continue;
-    }
+    while ((newline = strchr(buffer, '\n')) != NULL) {
+      *newline = '\0';
+      char *start_next_cmd = newline + 1;
+      printf("[Client %d] %s\n", client_fd, buffer);
 
-    if (strcmp(cmd, "SET") == 0) {
-      char *key = strtok_r(NULL, " \r\n", &saveptr);
-      char *value = strtok_r(NULL, "\r\n", &saveptr);
+      // parsing
+      char *saveptr;
+      char *cmd = strtok_r(buffer, " \r\n", &saveptr);
 
-      if (key == NULL || value == NULL) {
-        char *msg = "ERR usage: SET key value\n";
-        send(client_fd, msg, strlen(msg), 0);
-        continue;
+      if (cmd != NULL) {
+        if (strcmp(cmd, "SET") == 0) {
+          char *key = strtok_r(NULL, " \r\n", &saveptr);
+          char *value = strtok_r(NULL, "\r\n", &saveptr);
+
+          if (key == NULL || value == NULL) {
+            char *msg = "ERR usage: SET key value\n";
+            send(client_fd, msg, strlen(msg), 0);
+          } else {
+            client_execute_set(db, key, value);
+            char *msg = "OK\n";
+            send(client_fd, msg, strlen(msg), 0);
+          }
+        } else if (strcmp(cmd, "GET") == 0) {
+          char *key = strtok_r(NULL, " \r\n", &saveptr);
+
+          if (key == NULL) {
+            char *msg = "ERR usage: GET key\n";
+            send(client_fd, msg, strlen(msg), 0);
+          } else {
+            char *value = hashmap_get(db, key);
+            if (value) {
+              char response[BUFFER_SIZE];
+              snprintf(response, sizeof(response), "%s\n", value);
+              send(client_fd, response, strlen(response), 0);
+              free(value);
+            } else {
+              char *msg = "NULL\n";
+              send(client_fd, msg, strlen(msg), 0);
+            }
+          }
+        } else if (strcmp(cmd, "DEL") == 0) {
+          char *key = strtok_r(NULL, " \r\n", &saveptr);
+
+          if (key == NULL) {
+            char *msg = "ERR usage: DEL key\n";
+            send(client_fd, msg, strlen(msg), 0);
+          } else {
+            client_execute_del(db, key);
+            char *msg = "OK\n";
+            send(client_fd, msg, strlen(msg), 0);
+          }
+        } else if (strcmp(cmd, "SAVE") == 0) {
+          if (checkpoint_database(db, "data/dump.txt") == 0) {
+            char *msg = "OK\n";
+            send(client_fd, msg, strlen(msg), 0);
+          } else {
+            char *msg = "ERR save failed\n";
+            send(client_fd, msg, strlen(msg), 0);
+          }
+        } else {
+          char *msg = "ERR unknown command\n";
+          send(client_fd, msg, strlen(msg), 0);
+        }
       }
 
-      client_execute_set(db, key, value);
-
-      char *msg = "OK\n";
-      send(client_fd, msg, strlen(msg), 0);
-    } else if (strcmp(cmd, "GET") == 0) {
-      char *key = strtok_r(NULL, " \r\n", &saveptr);
-
-      if (key == NULL) {
-        char *msg = "ERR usage: GET key\n";
-        send(client_fd, msg, strlen(msg), 0);
-        continue;
-      }
-
-      char *value = hashmap_get(db, key);
-
-      if (value) {
-        char response[BUFFER_SIZE];
-        snprintf(response, sizeof(response), "%s\n", value);
-        send(client_fd, response, strlen(response), 0);
-        free(value);
-      } else {
-        char *msg = "NULL\n";
-        send(client_fd, msg, strlen(msg), 0);
-        free(value); // Safe
-      }
-    } else if (strcmp(cmd, "DEL") == 0) {
-      char *key = strtok_r(NULL, " \r\n", &saveptr);
-
-      if (key == NULL) {
-        char *msg = "ERR usage: DEL key\n";
-        send(client_fd, msg, strlen(msg), 0);
-        continue;
-      }
-
-      client_execute_del(db, key);
-
-      char *msg = "OK\n";
-      send(client_fd, msg, strlen(msg), 0);
-    } else if (strcmp(cmd, "SAVE") == 0) {
-      if (checkpoint_database(db, "data/dump.txt") == 0) {
-        char *msg = "OK\n";
-        send(client_fd, msg, strlen(msg), 0);
-      } else {
-        char *msg = "ERR save failed\n";
-        send(client_fd, msg, strlen(msg), 0);
-      }
-    } else {
-      char *msg = "ERR unknown command\n";
-      send(client_fd, msg, strlen(msg), 0);
+      memmove(buffer, start_next_cmd, strlen(start_next_cmd) + 1);
     }
   }
 
