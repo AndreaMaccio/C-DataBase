@@ -1,5 +1,6 @@
 #include "../include/hashmap.h"
 #include "../include/server.h"
+#include "../include/signalhandling.h"
 #include "../include/storage.h"
 #include <pthread.h>
 #include <stdio.h>
@@ -12,8 +13,10 @@
 hashmap_t *db;
 
 void *autosave_thread(void *arg) {
-  while (1) {
+  while (keep_running) {
     sleep(AUTOSAVE_INTERVAL);
+    if (!keep_running)
+      break;
     printf("[autosave] saving database...\n");
 
     if (checkpoint_database(db, "data/dump.txt") == 0) {
@@ -26,6 +29,7 @@ void *autosave_thread(void *arg) {
 }
 
 int main() {
+  setup_signal_handlers();
   printf("Avvio Database...\n");
 
   db = hashmap_create(128);
@@ -46,9 +50,15 @@ int main() {
     perror("pthread_create autosave");
     exit(EXIT_FAILURE);
   }
-  pthread_detach(autosave_tid);
 
   server_start(PORT, db);
+
+  printf("\n [Server] Spegimento in corso, attendere...\n");
+  pthread_join(autosave_tid, NULL);
+  printf("\n [Server] Esecuzione snapshot finale...\n");
+  checkpoint_database(db, "data/dump.txt");
+  hashmap_free(db);
+  printf("\n [Server] Scrittura sicura completata.");
 
   return 0;
 }

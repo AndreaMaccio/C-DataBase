@@ -1,4 +1,5 @@
 #include "../include/server.h"
+#include "../include/signalhandling.h"
 #include "../include/storage.h"
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -153,13 +154,18 @@ void server_start(int port, hashmap_t *db) {
 
   printf("Server in ascolto sulla porta %d\n", port);
 
-  while (1) {
+  while (keep_running) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
     int client_fd =
         accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
 
     if (client_fd < 0) {
+
+      if (!keep_running) {
+        break;
+      }
+
       perror("accept");
       continue;
     }
