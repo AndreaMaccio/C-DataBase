@@ -1,0 +1,17 @@
+# File compilati e binari
+bin/
+*.o
+*.out
+*.exe
+
+# Dati del Database (non vanno MAI caricati su Git)
+data/
+*.log
+*.txt
+
+# File di sistema e IDE
+.DS_Store
+.vscode/
+.idea/
+
+ROADMAP.md
