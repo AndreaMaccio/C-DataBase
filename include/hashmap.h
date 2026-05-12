@@ -1,5 +1,6 @@
 #ifndef HASHMAP_H
 #define HASHMAP_H
+#define MAX_LOAD 0.75
 
 #include <pthread.h>
 #include <stddef.h>
@@ -12,7 +13,7 @@ typedef struct entry {
 
 typedef struct {
   entry_t **buckets;
-  size_t size;
+  size_t size, count;
   pthread_mutex_t mutex;
 } hashmap_t;
 
@@ -30,4 +31,7 @@ void hashmap_del(hashmap_t *map, const char *key);
 
 void hashmap_del_nolock(hashmap_t *map, const char *key);
 
+void hashmap_expand(hashmap_t *map);
+
+void hashmap_expand_nolock(hashmap_t *map);
 #endif

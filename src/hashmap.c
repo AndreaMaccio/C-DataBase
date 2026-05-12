@@ -1,4 +1,5 @@
 #include "../include/hashmap.h"
+#include <_strings.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,12 +21,17 @@ static unsigned long hash(const char *str) {
 hashmap_t *hashmap_create(size_t size) {
   hashmap_t *map = malloc(sizeof(hashmap_t));
   map->size = size;
+  map->count = 0;
   map->buckets = calloc(size, sizeof(entry_t *));
   pthread_mutex_init(&map->mutex, NULL);
   return map;
 }
 
 void hashmap_set_nolock(hashmap_t *map, const char *key, const char *value) {
+  if (map->count > map->size * MAX_LOAD) {
+    hashmap_expand_nolock(map);
+  }
+
   unsigned long h = hash(key);
   size_t index = h % map->size;
   entry_t *current = map->buckets[index];
@@ -39,6 +45,7 @@ void hashmap_set_nolock(hashmap_t *map, const char *key, const char *value) {
   }
 
   entry_t *entry = malloc(sizeof(entry_t));
+  map->count++;
   entry->key = strdup(key);
   entry->value = strdup(value);
   entry->next = map->buckets[index];
@@ -102,6 +109,7 @@ void hashmap_del_nolock(hashmap_t *map, const char *key) {
       free(current->key);
       free(current->value);
       free(current);
+      map->count--;
 
       return;
     }
@@ -113,5 +121,44 @@ void hashmap_del_nolock(hashmap_t *map, const char *key) {
 void hashmap_del(hashmap_t *map, const char *key) {
   pthread_mutex_lock(&map->mutex);
   hashmap_del_nolock(map, key);
+  pthread_mutex_unlock(&map->mutex);
+}
+
+void hashmap_expand_nolock(hashmap_t *map) {
+  size_t new_size = map->size * 2;
+  entry_t **new_buckets = calloc(new_size, sizeof(entry_t *));
+
+  if (!new_buckets) {
+    perror("Ram Esaurita");
+    return;
+  }
+
+  for (size_t i = 0; i < map->size; i++) {
+    entry_t *current = map->buckets[i];
+
+    while (current != NULL) {
+      entry_t *next_node = current->next;
+
+      unsigned long h = hash(current->key);
+      size_t new_index = h % new_size;
+
+      current->next = new_buckets[new_index];
+      new_buckets[new_index] = current;
+
+      current = next_node;
+    }
+  }
+
+  free(map->buckets);
+
+  map->buckets = new_buckets;
+  map->size = new_size;
+
+  printf("[hashmap] Espansa a %zu bucket!\n", new_size);
+}
+
+void hashmap_expand(hashmap_t *map) {
+  pthread_mutex_lock(&map->mutex);
+  hashmap_expand_nolock(map);
   pthread_mutex_unlock(&map->mutex);
 }
