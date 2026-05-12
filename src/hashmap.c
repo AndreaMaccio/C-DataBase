@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 
+// djb2 hash function — simple, fast, and gives decent distribution
 static unsigned long hash(const char *str) {
   unsigned long h = 5381;
 
@@ -18,6 +19,7 @@ static unsigned long hash(const char *str) {
   return h;
 }
 
+// Allocates a new hashmap with `size` buckets (all initially empty)
 hashmap_t *hashmap_create(size_t size) {
   hashmap_t *map = malloc(sizeof(hashmap_t));
   map->size = size;
@@ -27,6 +29,9 @@ hashmap_t *hashmap_create(size_t size) {
   return map;
 }
 
+// _nolock variant: caller must hold the mutex.
+// If the key exists, update the value. Otherwise insert at the head of the chain.
+// Triggers expansion if load factor exceeds MAX_LOAD.
 void hashmap_set_nolock(hashmap_t *map, const char *key, const char *value) {
   if (map->count > map->size * MAX_LOAD) {
     hashmap_expand_nolock(map);
@@ -36,6 +41,7 @@ void hashmap_set_nolock(hashmap_t *map, const char *key, const char *value) {
   size_t index = h % map->size;
   entry_t *current = map->buckets[index];
 
+  // Check if key already exists in this bucket's chain
   while (current) {
     if (strcmp(current->key, key) == 0) {
       free(current->value);
@@ -44,6 +50,7 @@ void hashmap_set_nolock(hashmap_t *map, const char *key, const char *value) {
     }
   }
 
+  // Key not found, prepend a new entry
   entry_t *entry = malloc(sizeof(entry_t));
   map->count++;
   entry->key = strdup(key);
@@ -58,6 +65,8 @@ void hashmap_set(hashmap_t *map, const char *key, const char *value) {
   pthread_mutex_unlock(&map->mutex);
 }
 
+// Returns a strdup'd copy of the value (caller must free it), or NULL if not found.
+// We return a copy so the caller can safely use it after releasing the lock.
 char *hashmap_get(hashmap_t *map, const char *key) {
   pthread_mutex_lock(&map->mutex);
   unsigned long h = hash(key);
@@ -76,6 +85,7 @@ char *hashmap_get(hashmap_t *map, const char *key) {
   return NULL;
 }
 
+// Frees everything: all entries in every bucket, the bucket array, and the map itself
 void hashmap_free(hashmap_t *map) {
   for (size_t i = 0; i < map->size; i++) {
     entry_t *current = map->buckets[i];
@@ -94,6 +104,7 @@ void hashmap_free(hashmap_t *map) {
   free(map);
 }
 
+// Removes an entry from the chain. Handles both head and mid-chain removal.
 void hashmap_del_nolock(hashmap_t *map, const char *key) {
   unsigned long h = hash(key);
   size_t index = h % map->size;
@@ -124,15 +135,18 @@ void hashmap_del(hashmap_t *map, const char *key) {
   pthread_mutex_unlock(&map->mutex);
 }
 
+// Doubles the number of buckets and rehashes all existing entries.
+// This keeps lookup time close to O(1) by preventing chains from getting too long.
 void hashmap_expand_nolock(hashmap_t *map) {
   size_t new_size = map->size * 2;
   entry_t **new_buckets = calloc(new_size, sizeof(entry_t *));
 
   if (!new_buckets) {
-    perror("Ram Esaurita");
+    perror("Out of memory");
     return;
   }
 
+  // Rehash every entry into the new bucket array
   for (size_t i = 0; i < map->size; i++) {
     entry_t *current = map->buckets[i];
 
@@ -154,7 +168,7 @@ void hashmap_expand_nolock(hashmap_t *map) {
   map->buckets = new_buckets;
   map->size = new_size;
 
-  printf("[hashmap] Espansa a %zu bucket!\n", new_size);
+  printf("[hashmap] Expanded to %zu buckets!\n", new_size);
 }
 
 void hashmap_expand(hashmap_t *map) {

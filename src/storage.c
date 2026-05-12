@@ -19,6 +19,8 @@ int storage_init(const char *wal_path) {
   return 0;
 }
 
+// Blocking checkpoint: dumps entire hashmap to disk, then clears the WAL.
+// Lock order: wal_mutex first, then map->mutex (always, to prevent deadlocks).
 int checkpoint_database(hashmap_t *map, const char *snapshot_file) {
   pthread_mutex_lock(&wal_mutex);
   pthread_mutex_lock(&map->mutex);
@@ -42,6 +44,7 @@ int checkpoint_database(hashmap_t *map, const char *snapshot_file) {
   fsync(fileno(fp));
   fclose(fp);
 
+  // Snapshot is safe on disk, WAL can be truncated
   fflush(wal_fp);
   fsync(fileno(wal_fp));
   ftruncate(fileno(wal_fp), 0);
@@ -53,6 +56,7 @@ int checkpoint_database(hashmap_t *map, const char *snapshot_file) {
   return 0;
 }
 
+// Loads a text snapshot (key=value per line) into memory at startup
 int storage_load_snapshot(hashmap_t *map, const char *filename) {
   FILE *fp = fopen(filename, "r");
   if (!fp) {
@@ -74,6 +78,8 @@ int storage_load_snapshot(hashmap_t *map, const char *filename) {
   return 0;
 }
 
+// Atomic SET: writes to binary WAL first, then updates the hashmap.
+// Both locks held to keep WAL and memory in sync.
 void client_execute_set(hashmap_t *map, const char *key, const char *value) {
   pthread_mutex_lock(&wal_mutex);
   pthread_mutex_lock(&map->mutex);
@@ -83,6 +89,7 @@ void client_execute_set(hashmap_t *map, const char *key, const char *value) {
   header.key_len = strlen(key);
   header.val_len = strlen(value);
 
+  // Raw bytes: header (9B) + key + value. No text separators.
   fwrite(&header, sizeof(header), 1, wal_fp);
   fwrite(key, 1, header.key_len, wal_fp);
   fwrite(value, 1, header.val_len, wal_fp);
@@ -94,6 +101,7 @@ void client_execute_set(hashmap_t *map, const char *key, const char *value) {
   pthread_mutex_unlock(&wal_mutex);
 }
 
+// Same write-ahead pattern as SET but for deletions
 void client_execute_del(hashmap_t *map, const char *key) {
   pthread_mutex_lock(&wal_mutex);
   pthread_mutex_lock(&map->mutex);
@@ -113,6 +121,7 @@ void client_execute_del(hashmap_t *map, const char *key) {
   pthread_mutex_unlock(&wal_mutex);
 }
 
+// Replays a single binary WAL file, reading header-by-header
 void storage_replay_wal_file(hashmap_t *map, const char *filepath) {
   FILE *fp = fopen(filepath, "r");
   if (!fp) {
@@ -148,15 +157,17 @@ void storage_replay_wal_file(hashmap_t *map, const char *filepath) {
   fclose(fp);
 }
 
+// Replays both WAL files in order for full crash recovery:
+// 1) wal.log.old (pre-bgsave ops)  2) wal.log (post-bgsave ops)
 int storage_replay_wal(hashmap_t *map) {
-
   storage_replay_wal_file(map, "data/wal.log.old");
-
   storage_replay_wal_file(map, "data/wal.log");
-
   return 0;
 }
 
+// Non-blocking snapshot via fork(). Child inherits the hashmap
+// through OS Copy-on-Write and writes to a temp file.
+// Parent keeps serving clients without pausing.
 int bgsave_database(hashmap_t *map, const char *snapshot_file,
                     const char *wal_path) {
   pid_t pid;
@@ -167,6 +178,7 @@ int bgsave_database(hashmap_t *map, const char *snapshot_file,
   pthread_mutex_lock(&wal_mutex);
   pthread_mutex_lock(&map->mutex);
 
+  // WAL rotation: close -> rename to .old -> open fresh
   fclose(wal_fp);
   rename(wal_path, old_wal_path);
   wal_fp = fopen(wal_path, "a");
@@ -174,6 +186,7 @@ int bgsave_database(hashmap_t *map, const char *snapshot_file,
   pid = fork();
 
   if (!pid) {
+    // Child: write snapshot to temp file
     FILE *fp = fopen("data/dump_temp.txt", "w");
     if (!fp)
       exit(1);
@@ -192,16 +205,19 @@ int bgsave_database(hashmap_t *map, const char *snapshot_file,
     exit(0);
   }
 
+  // Parent: unlock so the server can keep working
   pthread_mutex_unlock(&wal_mutex);
   pthread_mutex_unlock(&map->mutex);
+
   waitpid(pid, &status, 0);
   if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    // Atomic rename: no partial file risk
     rename("data/dump_temp.txt", snapshot_file);
     remove(old_wal_path);
-    printf("[bgsave] Snapshot salvato in background!\n");
+    printf("[bgsave] Snapshot saved in background!\n");
     return 0;
   } else {
-    perror("[bgsave] Errore nel salvataggio del figlio.\n");
+    perror("[bgsave] Child process failed\n");
     return -1;
   }
 }

@@ -8,6 +8,11 @@
 
 #define PORT 8080
 
+// Parses user text input (e.g. "SET foo bar") into a binary header
+// and extracts pointers to key/value within the original string.
+// Returns 0 on success, -1 if the syntax is wrong.
+// Note: key and value point into `line` (modified by strtok_r),
+// so they're only valid until the next call.
 int parse_user_input(char *line, protocol_header_t *header, char **key,
                      char **value) {
   char *saveptr;
@@ -18,10 +23,10 @@ int parse_user_input(char *line, protocol_header_t *header, char **key,
   if (strcmp(cmd, "SET") == 0) {
     header->opcode = OP_SET;
     *key = strtok_r(NULL, " ", &saveptr);
-    *value = strtok_r(NULL, "", &saveptr);
+    *value = strtok_r(NULL, "", &saveptr); // rest of the line is the value
 
     if (!*key || !*value) {
-      printf("Errore. Uso corretto: SET <chiave> <valore>\n");
+      printf("Error. Usage: SET <key> <value>\n");
       return -1;
     }
     header->key_len = strlen(*key);
@@ -33,7 +38,7 @@ int parse_user_input(char *line, protocol_header_t *header, char **key,
     *key = strtok_r(NULL, " ", &saveptr);
 
     if (!*key) {
-      printf("Errore. Uso corretto: GET <chiave>\n");
+      printf("Error. Usage: GET <key>\n");
       return -1;
     }
     header->key_len = strlen(*key);
@@ -45,7 +50,7 @@ int parse_user_input(char *line, protocol_header_t *header, char **key,
     *key = strtok_r(NULL, " ", &saveptr);
 
     if (!*key) {
-      printf("Errore. Uso corretto: DEL <chiave>\n");
+      printf("Error. Usage: DEL <key>\n");
       return -1;
     }
     header->key_len = strlen(*key);
@@ -58,7 +63,7 @@ int parse_user_input(char *line, protocol_header_t *header, char **key,
     return 0;
   }
 
-  printf("Comando sconosciuto.\n");
+  printf("Unknown command.\n");
   return -1;
 }
 
@@ -66,12 +71,14 @@ int main(void) {
   int socket_fd;
   struct sockaddr_in server_addr;
 
+  // Create a TCP socket to talk to the server
   socket_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (socket_fd < 0) {
     perror("socket");
     exit(EXIT_FAILURE);
   }
 
+  // We connect to localhost on the same port the server listens on
   memset(&server_addr, 0, sizeof(server_addr));
   server_addr.sin_family = AF_INET;
   server_addr.sin_port = htons(PORT);
@@ -84,7 +91,7 @@ int main(void) {
     exit(EXIT_FAILURE);
   }
 
-  printf("Connesso al Database con successo!\n");
+  printf("Connected to database!\n");
 
   char line[1024];
   while (1) {
@@ -101,6 +108,8 @@ int main(void) {
     char *value = NULL;
 
     if (parse_user_input(line, &header, &key, &value) == 0) {
+      // Send the 9-byte header first, then key and value payloads.
+      // The server knows exactly how many bytes to expect from the header.
       send(socket_fd, &header, sizeof(header), 0);
       if (header.key_len > 0) {
         send(socket_fd, key, header.key_len, 0);

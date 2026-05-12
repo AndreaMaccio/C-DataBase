@@ -8,11 +8,15 @@
 #include <unistd.h>
 
 #define PORT 8080
-#define AUTOSAVE_INTERVAL 30
+#define AUTOSAVE_INTERVAL 30 // seconds between automatic background saves
 
 hashmap_t *db;
 
+// Background thread that periodically triggers a non-blocking snapshot.
+// Uses bgsave (fork-based) so the server keeps serving clients
+// while the child process writes to disk.
 void *autosave_thread(void *arg) {
+  (void)arg;
   while (keep_running) {
     sleep(AUTOSAVE_INTERVAL);
     if (!keep_running)
@@ -30,35 +34,42 @@ void *autosave_thread(void *arg) {
 
 int main() {
   setup_signal_handlers();
-  printf("Avvio Database...\n");
+  printf("Starting database...\n");
 
   db = hashmap_create(128);
 
+  // Open the WAL file for appending new operations
   if (storage_init("data/wal.log") != 0) {
-    fprintf(stderr, "Errore inizializzazione storage\n");
+    fprintf(stderr, "Storage initialization failed\n");
     exit(EXIT_FAILURE);
   }
 
-  printf("Caricamento snapshot precedente...\n");
+  // Recovery sequence: first load the last full snapshot,
+  // then replay any operations that happened after it
+  printf("Loading previous snapshot...\n");
   storage_load_snapshot(db, "data/dump.txt");
 
-  printf("Replay del WAL in corso...\n");
+  printf("Replaying WAL...\n");
   storage_replay_wal(db);
 
+  // Kick off the autosave thread before starting the server
   pthread_t autosave_tid;
   if (pthread_create(&autosave_tid, NULL, autosave_thread, NULL) != 0) {
     perror("pthread_create autosave");
     exit(EXIT_FAILURE);
   }
 
+  // This blocks until keep_running becomes 0 (via SIGINT/SIGTERM)
   server_start(PORT, db);
 
-  printf("\n [Server] Spegimento in corso, attendere...\n");
+  // Graceful shutdown: wait for autosave to finish, then do
+  // one final checkpoint so we don't lose recent writes
+  printf("\n [Server] Shutting down, please wait...\n");
   pthread_join(autosave_tid, NULL);
-  printf("\n [Server] Esecuzione snapshot finale...\n");
+  printf("\n [Server] Running final snapshot...\n");
   checkpoint_database(db, "data/dump.txt");
   hashmap_free(db);
-  printf("\n [Server] Scrittura sicura completata.");
+  printf("\n [Server] Safe write completed.\n");
 
   return 0;
 }
