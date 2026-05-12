@@ -6,20 +6,27 @@ SRCDIR = src
 INCDIR = include
 BINDIR = bin
 
-SRCS = $(wildcard $(SRCDIR)/*.c)
-OBJS = $(SRCS:$(SRCDIR)/%.c=$(BINDIR)/%.o)
-EXEC = $(BINDIR)/server
+SERVER_SRCS = $(SRCDIR)/main.c $(SRCDIR)/server.c $(SRCDIR)/storage.c $(SRCDIR)/hashmap.c $(SRCDIR)/signalhandling.c
+SERVER_OBJS = $(SERVER_SRCS:$(SRCDIR)/%.c=$(BINDIR)/%.o)
+SERVER_EXEC = $(BINDIR)/server
 
-.PHONY: all clean
+CLI_SRCS = $(SRCDIR)/cli.c
+CLI_OBJS = $(CLI_SRCS:$(SRCDIR)/%.c=$(BINDIR)/%.o)
+CLI_EXEC = $(BINDIR)/cli
 
-all: directories $(EXEC)
+.PHONY: all clean directories
+
+all: directories $(SERVER_EXEC) $(CLI_EXEC)
 
 directories:
 	@mkdir -p $(BINDIR)
 	@mkdir -p data
 
-$(EXEC): $(OBJS)
-	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+$(SERVER_EXEC): $(SERVER_OBJS)
+	$(CC) $(SERVER_OBJS) -o $@ $(LDFLAGS)
+
+$(CLI_EXEC): $(CLI_OBJS)
+	$(CC) $(CLI_OBJS) -o $@ $(LDFLAGS)
 
 $(BINDIR)/%.o: $(SRCDIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@

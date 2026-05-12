@@ -1,4 +1,5 @@
 #include "../include/storage.h"
+#include "../include/protocol.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,7 +78,14 @@ void client_execute_set(hashmap_t *map, const char *key, const char *value) {
   pthread_mutex_lock(&wal_mutex);
   pthread_mutex_lock(&map->mutex);
 
-  fprintf(wal_fp, "SET %s %s\n", key, value);
+  protocol_header_t header;
+  header.opcode = OP_SET;
+  header.key_len = strlen(key);
+  header.val_len = strlen(value);
+
+  fwrite(&header, sizeof(header), 1, wal_fp);
+  fwrite(key, 1, header.key_len, wal_fp);
+  fwrite(value, 1, header.val_len, wal_fp);
   fflush(wal_fp);
 
   hashmap_set_nolock(map, key, value);
@@ -90,7 +98,13 @@ void client_execute_del(hashmap_t *map, const char *key) {
   pthread_mutex_lock(&wal_mutex);
   pthread_mutex_lock(&map->mutex);
 
-  fprintf(wal_fp, "DEL %s\n", key);
+  protocol_header_t header;
+  header.opcode = OP_DEL;
+  header.key_len = strlen(key);
+  header.val_len = 0;
+
+  fwrite(&header, sizeof(header), 1, wal_fp);
+  fwrite(key, 1, header.key_len, wal_fp);
   fflush(wal_fp);
 
   hashmap_del_nolock(map, key);
@@ -105,27 +119,31 @@ void storage_replay_wal_file(hashmap_t *map, const char *filepath) {
     return;
   }
 
-  char line[1024];
-  while (fgets(line, sizeof(line), fp)) {
-    line[strcspn(line, "\n")] = '\0';
-    char *saveptr;
-    char *cmd = strtok_r(line, " ", &saveptr);
-    if (!cmd) {
-      continue;
+  protocol_header_t header;
+  while (fread(&header, sizeof(header), 1, fp) == 1) {
+    char *key = NULL;
+    char *value = NULL;
+
+    if (header.key_len > 0) {
+      key = malloc(header.key_len + 1);
+      fread(key, 1, header.key_len, fp);
+      key[header.key_len] = '\0';
     }
 
-    if (strcmp(cmd, "SET") == 0) {
-      char *key = strtok_r(NULL, " ", &saveptr);
-      char *value = strtok_r(NULL, "", &saveptr);
-      if (key && value) {
-        hashmap_set(map, key, value);
-      }
-    } else if (strcmp(cmd, "DEL") == 0) {
-      char *key = strtok_r(NULL, " ", &saveptr);
-      if (key) {
-        hashmap_del(map, key);
-      }
+    if (header.val_len > 0) {
+      value = malloc(header.val_len + 1);
+      fread(value, 1, header.val_len, fp);
+      value[header.val_len] = '\0';
     }
+
+    if (header.opcode == OP_SET) {
+      hashmap_set(map, key, value);
+    } else if (header.opcode == OP_DEL) {
+      hashmap_del(map, key);
+    }
+
+    if (key) free(key);
+    if (value) free(value);
   }
   fclose(fp);
 }
