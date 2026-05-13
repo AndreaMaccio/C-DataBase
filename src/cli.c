@@ -108,6 +108,7 @@ int main(void) {
     char *value = NULL;
 
     if (parse_user_input(line, &header, &key, &value) == 0) {
+      char *response;
       // Send the 9-byte header first, then key and value payloads.
       // The server knows exactly how many bytes to expect from the header.
       send(socket_fd, &header, sizeof(header), 0);
@@ -117,6 +118,19 @@ int main(void) {
       if (header.val_len > 0) {
         send(socket_fd, value, header.val_len, 0);
       }
+
+      recv(socket_fd, &header, sizeof(header), MSG_WAITALL);
+      if (header.opcode == OP_OK) {
+        if (header.val_len > 0) {
+          response = malloc(sizeof(char) * (header.val_len + 1));
+          recv(socket_fd, response, header.val_len, MSG_WAITALL);
+          response[header.val_len] = '\0';
+          printf("%s\n", response);
+          free(response);
+        } else if (header.val_len == 0)
+          printf("OK\n");
+      } else if (header.opcode == OP_NULL)
+        printf("(nil)\n");
     }
   }
 

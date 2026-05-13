@@ -151,8 +151,10 @@ void storage_replay_wal_file(hashmap_t *map, const char *filepath) {
       hashmap_del(map, key);
     }
 
-    if (key) free(key);
-    if (value) free(value);
+    if (key)
+      free(key);
+    if (value)
+      free(value);
   }
   fclose(fp);
 }

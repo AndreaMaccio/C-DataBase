@@ -71,6 +71,10 @@ static void *client_handler(void *arg) {
            header.opcode, (key != NULL) ? key : "(none)",
            (value != NULL) ? value : "(none)");
 
+    // Save original lengths before the switch overwrites the header
+    uint32_t orig_key_len = header.key_len;
+    uint32_t orig_val_len = header.val_len;
+
     switch (header.opcode) {
     case OP_SET:
       client_execute_set(db, key, value);
@@ -96,23 +100,35 @@ static void *client_handler(void *arg) {
       header.val_len = strlen(result);
 
       send(client_fd, &header, sizeof(protocol_header_t), 0);
-      send(client_fd, &result, header.val_len, 0);
+      send(client_fd, result, header.val_len, 0);
       free(result);
       break;
     }
     case OP_DEL:
       client_execute_del(db, key);
+
+      header.opcode = OP_OK;
+      header.key_len = 0;
+      header.val_len = 0;
+
+      send(client_fd, &header, sizeof(protocol_header_t), 0);
       break;
     case OP_SAVE:
       checkpoint_database(db, "data/dump.txt");
+
+      header.opcode = OP_OK;
+      header.key_len = 0;
+      header.val_len = 0;
+
+      send(client_fd, &header, sizeof(protocol_header_t), 0);
+
       break;
     }
 
-    // Free this iteration's buffers to avoid leaking memory.
-    // The hashmap already made its own copies via strdup().
-    if (header.key_len > 0)
+    // Free using original values, they have been swapped for the response.
+    if (orig_key_len > 0)
       free(key);
-    if (header.val_len > 0)
+    if (orig_val_len > 0)
       free(value);
     key = NULL;
     value = NULL;
