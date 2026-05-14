@@ -1,9 +1,12 @@
 #include "../include/storage.h"
 #include "../include/protocol.h"
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -108,31 +111,48 @@ void client_execute_del(hashmap_t *map, const char *key) {
 
 // Replays a single binary WAL file, reading header-by-header
 void storage_replay_wal_file(hashmap_t *map, const char *filepath) {
-  FILE *fp = fopen(filepath, "r");
-  if (!fp) {
+  int fp = open(filepath, O_RDONLY);
+  if (fp < 0)
+    return;
+
+  struct stat st;
+  fstat(fp, &st);
+
+  if (st.st_size == 0) {
+    close(fp);
     return;
   }
 
-  protocol_header_t header;
-  while (fread(&header, sizeof(header), 1, fp) == 1) {
+  char *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fp, 0);
+  close(fp);
+
+  char *cursor = data;
+  char *end = data + st.st_size;
+
+  while (cursor + sizeof(protocol_header_t) <= end) {
+    protocol_header_t *h = (protocol_header_t *)cursor;
+    cursor += sizeof(protocol_header_t);
+
     char *key = NULL;
     char *value = NULL;
 
-    if (header.key_len > 0) {
-      key = malloc(header.key_len + 1);
-      fread(key, 1, header.key_len, fp);
-      key[header.key_len] = '\0';
+    if (h->key_len > 0) {
+      key = malloc(h->key_len + 1);
+      memcpy(key, cursor, h->key_len);
+      cursor += h->key_len;
+      key[h->key_len] = '\0';
     }
 
-    if (header.val_len > 0) {
-      value = malloc(header.val_len + 1);
-      fread(value, 1, header.val_len, fp);
-      value[header.val_len] = '\0';
+    if (h->val_len > 0) {
+      value = malloc(h->val_len + 1);
+      memcpy(value, cursor, h->val_len);
+      cursor += h->val_len;
+      value[h->val_len] = '\0';
     }
 
-    if (header.opcode == OP_SET) {
+    if (h->opcode == OP_SET) {
       hashmap_set(map, key, value);
-    } else if (header.opcode == OP_DEL) {
+    } else if (h->opcode == OP_DEL) {
       hashmap_del(map, key);
     }
 
@@ -141,7 +161,7 @@ void storage_replay_wal_file(hashmap_t *map, const char *filepath) {
     if (value)
       free(value);
   }
-  fclose(fp);
+  munmap(data, st.st_size);
 }
 
 // Replays both WAL files and DUMP in order for full crash recovery:
