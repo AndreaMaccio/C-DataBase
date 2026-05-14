@@ -32,10 +32,17 @@ int checkpoint_database(hashmap_t *map, const char *snapshot_file) {
     return -1;
   }
 
+  protocol_header_t header;
+  header.opcode = OP_SET;
+
   for (size_t i = 0; i < map->size; i++) {
     entry_t *current = map->buckets[i];
     while (current) {
-      fprintf(fp, "%s=%s\n", current->key, current->value);
+      header.key_len = strlen(current->key);
+      header.val_len = strlen(current->value);
+      fwrite(&header, sizeof(header), 1, fp);
+      fwrite(current->key, sizeof(char), header.key_len, fp);
+      fwrite(current->value, sizeof(char), header.val_len, fp);
       current = current->next;
     }
   }
@@ -53,28 +60,6 @@ int checkpoint_database(hashmap_t *map, const char *snapshot_file) {
   pthread_mutex_unlock(&map->mutex);
   pthread_mutex_unlock(&wal_mutex);
 
-  return 0;
-}
-
-// Loads a text snapshot (key=value per line) into memory at startup
-int storage_load_snapshot(hashmap_t *map, const char *filename) {
-  FILE *fp = fopen(filename, "r");
-  if (!fp) {
-    return -1;
-  }
-
-  char line[1024];
-  while (fgets(line, sizeof(line), fp)) {
-    line[strcspn(line, "\n")] = '\0';
-    char *saveptr;
-    char *key = strtok_r(line, "=", &saveptr);
-    char *value = strtok_r(NULL, "=", &saveptr);
-
-    if (key && value) {
-      hashmap_set(map, key, value);
-    }
-  }
-  fclose(fp);
   return 0;
 }
 
@@ -159,9 +144,10 @@ void storage_replay_wal_file(hashmap_t *map, const char *filepath) {
   fclose(fp);
 }
 
-// Replays both WAL files in order for full crash recovery:
+// Replays both WAL files and DUMP in order for full crash recovery:
 // 1) wal.log.old (pre-bgsave ops)  2) wal.log (post-bgsave ops)
 int storage_replay_wal(hashmap_t *map) {
+  storage_replay_wal_file(map, "data/dump.txt");
   storage_replay_wal_file(map, "data/wal.log.old");
   storage_replay_wal_file(map, "data/wal.log");
   return 0;
@@ -193,10 +179,17 @@ int bgsave_database(hashmap_t *map, const char *snapshot_file,
     if (!fp)
       exit(1);
 
+    protocol_header_t header;
+    header.opcode = OP_SET;
+
     for (size_t i = 0; i < map->size; i++) {
       entry_t *current = map->buckets[i];
       while (current) {
-        fprintf(fp, "%s=%s\n", current->key, current->value);
+        header.key_len = strlen(current->key);
+        header.val_len = strlen(current->value);
+        fwrite(&header, sizeof(header), 1, fp);
+        fwrite(current->key, sizeof(char), header.key_len, fp);
+        fwrite(current->value, sizeof(char), header.val_len, fp);
         current = current->next;
       }
     }

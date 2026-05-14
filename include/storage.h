@@ -11,8 +11,6 @@ void client_execute_del(hashmap_t *map, const char *key);
 
 int checkpoint_database(hashmap_t *map, const char *snapshot_file);
 
-int storage_load_snapshot(hashmap_t *map, const char *filename);
-
 int storage_replay_wal(hashmap_t *map);
 
 int bgsave_database(hashmap_t *map, const char *snapshot_file,

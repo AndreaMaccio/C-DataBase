@@ -44,11 +44,8 @@ int main() {
     exit(EXIT_FAILURE);
   }
 
-  // Recovery sequence: first load the last full snapshot,
-  // then replay any operations that happened after it
-  printf("Loading previous snapshot...\n");
-  storage_load_snapshot(db, "data/dump.txt");
-
+  // Recovery sequence: first load the last full snapshot (included in the wal
+  // replay), then replay any operations that happened after it
   printf("Replaying WAL...\n");
   storage_replay_wal(db);
 
