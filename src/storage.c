@@ -1,7 +1,6 @@
 #include "../include/storage.h"
 #include "../include/protocol.h"
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +10,6 @@
 #include <unistd.h>
 
 static FILE *wal_fp;
-static pthread_mutex_t wal_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int storage_init(const char *wal_path) {
   wal_fp = fopen(wal_path, "a");
@@ -23,15 +21,9 @@ int storage_init(const char *wal_path) {
 }
 
 // Blocking checkpoint: dumps entire hashmap to disk, then clears the WAL.
-// Lock order: wal_mutex first, then map->mutex (always, to prevent deadlocks).
 int checkpoint_database(hashmap_t *map, const char *snapshot_file) {
-  pthread_mutex_lock(&wal_mutex);
-  pthread_mutex_lock(&map->mutex);
-
   FILE *fp = fopen(snapshot_file, "w");
   if (!fp) {
-    pthread_mutex_unlock(&map->mutex);
-    pthread_mutex_unlock(&wal_mutex);
     return -1;
   }
 
@@ -60,40 +52,26 @@ int checkpoint_database(hashmap_t *map, const char *snapshot_file) {
   ftruncate(fileno(wal_fp), 0);
   fseek(wal_fp, 0, SEEK_SET);
 
-  pthread_mutex_unlock(&map->mutex);
-  pthread_mutex_unlock(&wal_mutex);
-
   return 0;
 }
 
 // Atomic SET: writes to binary WAL first, then updates the hashmap.
-// Both locks held to keep WAL and memory in sync.
 void client_execute_set(hashmap_t *map, const char *key, const char *value) {
-  pthread_mutex_lock(&wal_mutex);
-  pthread_mutex_lock(&map->mutex);
-
   protocol_header_t header;
   header.opcode = OP_SET;
   header.key_len = strlen(key);
   header.val_len = strlen(value);
 
-  // Raw bytes: header (9B) + key + value. No text separators.
   fwrite(&header, sizeof(header), 1, wal_fp);
   fwrite(key, 1, header.key_len, wal_fp);
   fwrite(value, 1, header.val_len, wal_fp);
   fflush(wal_fp);
 
-  hashmap_set_nolock(map, key, value);
-
-  pthread_mutex_unlock(&map->mutex);
-  pthread_mutex_unlock(&wal_mutex);
+  hashmap_set(map, key, value);
 }
 
 // Same write-ahead pattern as SET but for deletions
 void client_execute_del(hashmap_t *map, const char *key) {
-  pthread_mutex_lock(&wal_mutex);
-  pthread_mutex_lock(&map->mutex);
-
   protocol_header_t header;
   header.opcode = OP_DEL;
   header.key_len = strlen(key);
@@ -103,10 +81,7 @@ void client_execute_del(hashmap_t *map, const char *key) {
   fwrite(key, 1, header.key_len, wal_fp);
   fflush(wal_fp);
 
-  hashmap_del_nolock(map, key);
-
-  pthread_mutex_unlock(&map->mutex);
-  pthread_mutex_unlock(&wal_mutex);
+  hashmap_del(map, key);
 }
 
 // Replays a single binary WAL file, reading header-by-header
@@ -172,28 +147,66 @@ int storage_replay_wal(hashmap_t *map) {
   storage_replay_wal_file(map, "data/wal.log");
   return 0;
 }
+// Track the child process from a previous bgsave
+static pid_t bgsave_pid = -1;
+static char pending_snapshot[256];
+static char pending_old_wal[256];
+
+// Called during shutdown to wait for any in-flight bgsave child
+// and perform the rename/cleanup that would normally happen at the next timer tick.
+void bgsave_finalize(void) {
+  if (bgsave_pid <= 0)
+    return;
+
+  int status;
+  waitpid(bgsave_pid, &status, 0); // blocking wait — fine during shutdown
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    rename("data/dump_temp.txt", pending_snapshot);
+    remove(pending_old_wal);
+    printf("[bgsave] Pending snapshot finalized\n");
+  }
+  bgsave_pid = -1;
+}
 
 // Non-blocking snapshot via fork(). Child inherits the hashmap
 // through OS Copy-on-Write and writes to a temp file.
-// Parent keeps serving clients without pausing.
+// Parent returns immediately to the event loop.
 int bgsave_database(hashmap_t *map, const char *snapshot_file,
                     const char *wal_path) {
-  pid_t pid;
-  int status;
-  char old_wal_path[256];
-  snprintf(old_wal_path, sizeof(old_wal_path), "%s.old", wal_path);
 
-  pthread_mutex_lock(&wal_mutex);
-  pthread_mutex_lock(&map->mutex);
+  // Check if the previous bgsave child has finished
+  if (bgsave_pid > 0) {
+    int status;
+    pid_t result = waitpid(bgsave_pid, &status, WNOHANG);
+    if (result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+      // Previous child finished successfully, do the rename
+      rename("data/dump_temp.txt", pending_snapshot);
+      remove(pending_old_wal);
+      printf("[bgsave] Snapshot saved in background!\n");
+      bgsave_pid = -1;
+    } else if (result > 0) {
+      // Previous child failed
+      fprintf(stderr, "[bgsave] Child process failed\n");
+      bgsave_pid = -1;
+    } else {
+      // result == 0: previous child still running, skip this bgsave
+      printf("[bgsave] Previous save still running, skipping\n");
+      return 0;
+    }
+  }
+
+  // Save paths for the rename (will happen at the NEXT timer tick)
+  snprintf(pending_snapshot, sizeof(pending_snapshot), "%s", snapshot_file);
+  snprintf(pending_old_wal, sizeof(pending_old_wal), "%s.old", wal_path);
 
   // WAL rotation: close -> rename to .old -> open fresh
   fclose(wal_fp);
-  rename(wal_path, old_wal_path);
+  rename(wal_path, pending_old_wal);
   wal_fp = fopen(wal_path, "a");
 
-  pid = fork();
+  pid_t pid = fork();
 
-  if (!pid) {
+  if (pid == 0) {
     // Child: write snapshot to temp file
     FILE *fp = fopen("data/dump_temp.txt", "w");
     if (!fp)
@@ -220,19 +233,7 @@ int bgsave_database(hashmap_t *map, const char *snapshot_file,
     exit(0);
   }
 
-  // Parent: unlock so the server can keep working
-  pthread_mutex_unlock(&wal_mutex);
-  pthread_mutex_unlock(&map->mutex);
-
-  waitpid(pid, &status, 0);
-  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-    // Atomic rename: no partial file risk
-    rename("data/dump_temp.txt", snapshot_file);
-    remove(old_wal_path);
-    printf("[bgsave] Snapshot saved in background!\n");
-    return 0;
-  } else {
-    perror("[bgsave] Child process failed\n");
-    return -1;
-  }
+  // Parent: save the pid and return immediately to the event loop
+  bgsave_pid = pid;
+  return 0;
 }

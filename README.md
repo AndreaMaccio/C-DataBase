@@ -1,37 +1,81 @@
-# C-DataBase
+# ⚡ C-DataBase
 
-A high-performance, in-memory Key-Value database written entirely in C from scratch.
-Designed to explore advanced Systems Engineering concepts such as custom binary protocols, multi-threading, Copy-on-Write persistence, and crash recovery.
+A high-performance, in-memory Key-Value store written entirely in C from scratch.  
+Inspired by Redis internals: event-driven networking, binary protocol, memory-mapped I/O, and fork-based persistence.
+
+```
+┌──────────┐    Binary Protocol    ┌──────────────────────────────────────┐
+│  CLI     │◄─────────────────────►│  Server (kqueue event loop)         │
+│  Client  │   [9B header + payload]│                                     │
+└──────────┘                       │  ┌──────────┐    ┌───────────────┐  │
+                                   │  │ Hashmap   │    │ WAL (binary)  │  │
+                                   │  │ (in-memory)│   │ (append-only) │  │
+                                   │  └──────────┘    └───────────────┘  │
+                                   │         │              │            │
+                                   │         ▼              ▼            │
+                                   │  ┌─────────────────────────────┐   │
+                                   │  │  mmap replay on startup     │   │
+                                   │  │  fork() + CoW for snapshots │   │
+                                   │  └─────────────────────────────┘   │
+                                   └──────────────────────────────────────┘
+```
 
 ---
 
-# English
+## Architecture
 
-## Key Features
+### Event-Driven Networking (`kqueue`)
+A single-threaded event loop handles all client connections, timers, and I/O without any threads or locks.  
+Each client is tracked by a **state machine** (`HEADER → KEY → VALUE → PROCESS`) that handles partial reads on non-blocking sockets — the same pattern used by Redis, Nginx, and Node.js.
 
 ### Custom Binary Protocol
-Replaces traditional text-based protocols (like Redis' RESP) with a highly optimized, raw binary protocol over TCP. 
-By utilizing packed structs and strict byte-length headers, it completely eliminates string parsing (`strtok`) overhead, drastically improving memory safety and throughput. Includes a custom interactive CLI client to communicate with the engine.
+Every message is a packed 9-byte header followed by raw key/value payloads:
 
-### Non-Blocking BGSAVE (Copy-on-Write)
-Snapshots are generated asynchronously using `fork()`. The OS-level Copy-on-Write mechanism guarantees that the main database can continue serving thousands of clients at full speed while a background process writes a consistent snapshot to disk, eliminating I/O lock contention.
+```
+┌──────────┬───────────┬───────────┬─────────┬──────────┐
+│ opcode   │ key_len   │ val_len   │  key    │  value   │
+│ (1 byte) │ (4 bytes) │ (4 bytes) │ (N bytes)│ (M bytes)│
+└──────────┴───────────┴───────────┴─────────┴──────────┘
+```
 
-### Reliable ACID-Inspired Persistence
-The database adopts a Redis-inspired persistence strategy:
-* **Binary Write-Ahead Log (WAL)**: Mutating operations (`SET`, `DEL`) are appended as raw bytes to a persistent log file.
-* **Dual-File Crash Recovery**: Implements a robust `wal.log` rotation. During boot, the system sequentially replays `wal.log.old` and `wal.log` ensuring zero data loss even if a crash occurs during a snapshot rotation.
+Zero string parsing. The server casts raw bytes directly to a C struct — O(1) decode time.
 
-### Thread-Safe Architecture & Deadlock Prevention
-Implements a Thread-per-Client model using `pthreads`. Employs strict Lock Ordering (`wal_mutex -> map_mutex`) and `_nolock` transactional boundaries to guarantee atomic state consistency across memory and persistent storage without deadlocks.
+### Crash-Safe Persistence
+The storage engine implements a Redis-inspired durability strategy:
+
+| Layer | Purpose |
+|---|---|
+| **Write-Ahead Log** | Every `SET`/`DEL` is appended as binary to `wal.log` before updating memory |
+| **Binary Snapshots** | Full database dumps in the same binary format as the WAL |
+| **Dual-File Recovery** | On startup, replays `dump.txt` → `wal.log.old` → `wal.log` in sequence |
+
+### Non-Blocking BGSAVE (`fork` + Copy-on-Write)
+Snapshots are created via `fork()`. The OS provides a frozen copy of the hashmap through Copy-on-Write semantics — the parent continues serving clients at full speed while the child writes to disk. The parent never blocks: it saves the child PID and checks completion asynchronously via `waitpid(WNOHANG)`.
+
+### Memory-Mapped I/O (`mmap`)
+WAL and snapshot files are loaded at startup using `mmap` instead of `fread`. The kernel maps the file directly into virtual memory, eliminating per-entry syscall overhead and leveraging the OS page cache for optimal performance.
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|---|---|
+| Language | C (C11, no external dependencies) |
+| Networking | `kqueue` event loop (macOS/BSD) |
+| Protocol | Custom binary, packed structs |
+| Data Structure | Chained hashmap with dynamic expansion |
+| Persistence | Binary WAL + fork-based snapshots |
+| File I/O | `mmap` for reads, `fwrite` for appends |
+| Build | `make` + `gcc` |
 
 ---
 
 ## Build & Run
 
 ### Prerequisites
-* POSIX-compliant operating system (Linux/macOS)
-* `gcc`
-* `make`
+- macOS (uses `kqueue` for the event loop)
+- `gcc` and `make`
 
 ### Compilation
 ```bash
@@ -39,74 +83,71 @@ git clone https://github.com/AndreaMaccio/C-DataBase.git
 cd C-DataBase
 make
 ```
-This will compile both the Database Server and the CLI Client in the `bin/` directory.
 
 ### Usage
 
-**1. Start the Server**
+**1. Start the server:**
 ```bash
 ./bin/server
 ```
-The server binds to `localhost:8080`. Persistence files (`dump.txt` and `wal.log`) are stored in `data/`.
+The server listens on `localhost:8080`. Persistence files are stored in `data/`.
 
-**2. Connect via Custom CLI**
-```bash
-./bin/cli
-```
-Available commands in the interactive shell:
-* `SET <key> <value>`: Stores a key-value pair and appends to the Binary WAL.
-* `GET <key>`: Retrieves the value associated with a key.
-* `DEL <key>`: Removes a key from the database.
-* `SAVE`: Forces an immediate background snapshot (`BGSAVE`).
-
----
-
-## Roadmap
-
-### 1. Event-Driven Networking (Event Loop)
-Migrate from the Thread-per-Client model to a single-threaded asynchronous architecture based on `epoll` (Linux) / `kqueue` (macOS) to eliminate context-switching overhead and support tens of thousands of concurrent connections (C10k problem).
-
----
-
-# Italiano
-
-## Caratteristiche Principali
-
-### Protocollo Binario Custom
-Sostituisce i tradizionali protocolli testuali con un protocollo binario raw su TCP altamente ottimizzato. 
-Utilizzando struct packed e lunghezze prefissate nell'header, elimina completamente l'overhead del parsing testuale, migliorando drasticamente la sicurezza della memoria e il throughput. Include un Client CLI custom interattivo per la comunicazione di rete.
-
-### BGSAVE Non Bloccante (Copy-on-Write)
-I dump della memoria vengono generati in modo asincrono tramite `fork()`. Il meccanismo di Copy-on-Write a livello di Sistema Operativo permette al database principale di continuare a servire i client a piena velocità mentre un processo in background scrive uno snapshot coerente su disco, azzerando le latenze di I/O.
-
-### Persistenza Affidabile
-Il sistema utilizza una strategia di persistenza ispirata a Redis:
-* **Write-Ahead Log Binario (WAL)**: Ogni operazione di scrittura viene registrata in formato binario su file.
-* **Crash Recovery a Doppio File**: Implementa una solida logica di rotazione del WAL. All'avvio, il sistema ricostruisce lo stato rileggendo sequenzialmente `wal.log.old` e `wal.log`, garantendo zero perdita di dati anche in caso di interruzione di corrente durante un backup.
-
-### Architettura Thread-Safe
-Implementa un modello Thread-per-Client tramite `pthreads` con una rigorosa politica di Lock Ordering per prevenire i deadlock durante gli aggiornamenti atomici tra RAM e Disco.
-
----
-
-## Compilazione e Avvio
-
-```bash
-make clean && make
-```
-
-Avvia il server:
-```bash
-./bin/server
-```
-
-Connettiti con il client:
+**2. Connect via CLI:**
 ```bash
 ./bin/cli
 ```
 
-*(Non è più possibile usare `netcat` a causa del protocollo binario).*
+**3. Available commands:**
+```
+SET <key> <value>   Store a key-value pair (written to WAL first)
+GET <key>           Retrieve a value
+DEL <key>           Remove a key
+SAVE                Trigger an immediate snapshot
+```
+
+**4. Graceful shutdown:**  
+Press `Ctrl+C` — the server completes a final checkpoint before exiting.
 
 ---
 
-Sviluppato da Andrea Macciocca.
+## Project Structure
+
+```
+├── include/
+│   ├── hashmap.h        # Hash table interface
+│   ├── protocol.h       # Binary protocol definitions (opcodes, packed header)
+│   ├── server.h         # Server interface
+│   ├── signalhandling.h # Signal handler setup
+│   └── storage.h        # Persistence layer interface
+├── src/
+│   ├── main.c           # Entry point, recovery sequence, shutdown
+│   ├── server.c         # kqueue event loop, client state machine
+│   ├── storage.c        # WAL, checkpoint, bgsave, mmap replay
+│   ├── hashmap.c        # Chained hashmap with dynamic resizing
+│   ├── signalhandling.c # SIGINT/SIGTERM handlers
+│   └── cli.c            # Interactive CLI client
+├── data/                # Runtime persistence files (auto-created)
+└── Makefile
+```
+
+---
+
+## Key Design Decisions
+
+- **Single-threaded by design**: No mutexes, no deadlocks, no race conditions. The event loop serializes all operations naturally.
+- **Binary everywhere**: The same `[header][key][value]` format is used for the wire protocol, WAL, and snapshots. One parser to rule them all.
+- **Deferred cleanup**: `bgsave` tracks child PIDs globally and checks completion asynchronously, ensuring the event loop never blocks on disk I/O.
+- **Copy-on-Write over locking**: Instead of locking the hashmap during a snapshot, `fork()` gives the child a frozen copy for free via OS-level page table duplication.
+
+---
+
+## Limitations & Future Work
+
+- **macOS only**: Uses `kqueue`. An `epoll` backend (or `poll` for portability) could be added via `#ifdef`.
+- **No TTL/expiry**: Keys persist forever. A timer-based eviction system could be added to the event loop.
+- **No authentication**: All clients have full access. A simple AUTH command could gate connections.
+- **No replication**: Single-node only. Leader-follower replication would be a natural next step.
+
+---
+
+Built from scratch by **Andrea Macciocca**.

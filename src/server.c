@@ -3,139 +3,144 @@
 #include "../include/signalhandling.h"
 #include "../include/storage.h"
 #include <arpa/inet.h>
-#include <pthread.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/event.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define BUFFER_SIZE 1024
+// Per-client state machine for non-blocking I/O
+typedef enum {
+  STATE_HEADER,
+  STATE_KEY,
+  STATE_VALUE,
+  STATE_PROCESS
+} client_state_t;
 
-// Struct we malloc for each new client thread.
-// Has to be heap-allocated because the accept loop would overwrite
-// a stack variable before the new thread gets a chance to read it.
 typedef struct {
-  int client_fd;
-  hashmap_t *db;
-} client_args_t;
-
-// Each connected client gets its own thread running this function.
-// Reads binary packets (header + payload), executes the command,
-// and sends back a response on the same client_fd.
-static void *client_handler(void *arg) {
-  client_args_t *args = (client_args_t *)arg;
-  int client_fd = args->client_fd;
-  hashmap_t *db = args->db;
-  free(args); // we copied what we need, free the heap struct
-
+  int fd;
+  client_state_t state;
   protocol_header_t header;
-  char *key = NULL;
-  char *value = NULL;
-  ssize_t bytes_received;
+  char *key;
+  char *value;
+  size_t bytes_read;
+} client_t;
 
-  printf("Client thread started\n");
+void set_nonblocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
-  while (1) {
-    // Block until we get a full 9-byte header.
-    // MSG_WAITALL prevents partial reads from waking us up early.
-    bytes_received =
-        recv(client_fd, &header, sizeof(protocol_header_t), MSG_WAITALL);
-
-    if (bytes_received < 0) {
-      perror("recv");
-      break;
+void handle_client(client_t *c, hashmap_t *db) {
+  if (c->state == STATE_HEADER) {
+    ssize_t n = read(c->fd, (char *)&c->header + c->bytes_read,
+                     sizeof(protocol_header_t) - c->bytes_read);
+    if (n <= 0)
+      return;
+    c->bytes_read += n;
+    if (c->bytes_read == sizeof(protocol_header_t)) {
+      c->bytes_read = 0;
+      if (c->header.key_len > 0) {
+        c->key = malloc(c->header.key_len + 1);
+        c->state = STATE_KEY;
+      } else if (c->header.val_len > 0) {
+        c->value = malloc(c->header.val_len + 1);
+        c->state = STATE_VALUE;
+      } else {
+        c->state = STATE_PROCESS;
+      }
     }
+  }
 
-    if (bytes_received == 0) {
-      printf("Client disconnected\n");
-      break;
+  if (c->state == STATE_KEY) {
+    ssize_t n =
+        read(c->fd, c->key + c->bytes_read, c->header.key_len - c->bytes_read);
+    if (n <= 0)
+      return;
+    c->bytes_read += n;
+    if (c->bytes_read == c->header.key_len) {
+      c->key[c->header.key_len] = '\0';
+      c->bytes_read = 0;
+      if (c->header.val_len > 0) {
+        c->value = malloc(c->header.val_len + 1);
+        c->state = STATE_VALUE;
+      } else {
+        c->state = STATE_PROCESS;
+      }
     }
+  }
 
-    // Allocate exact-size buffers based on lengths from the header.
-    // +1 for the null terminator that we add ourselves (the client
-    // doesn't send it, to save bandwidth).
-    if (header.key_len > 0) {
-      key = malloc(header.key_len + 1);
-      recv(client_fd, key, header.key_len, MSG_WAITALL);
-      key[header.key_len] = '\0';
+  if (c->state == STATE_VALUE) {
+    ssize_t n = read(c->fd, c->value + c->bytes_read,
+                     c->header.val_len - c->bytes_read);
+    if (n <= 0)
+      return;
+    c->bytes_read += n;
+    if (c->bytes_read == c->header.val_len) {
+      c->value[c->header.val_len] = '\0';
+      c->bytes_read = 0;
+      c->state = STATE_PROCESS;
     }
+  }
 
-    if (header.val_len > 0) {
-      value = malloc(header.val_len + 1);
-      recv(client_fd, value, header.val_len, MSG_WAITALL);
-      value[header.val_len] = '\0';
-    }
+  if (c->state == STATE_PROCESS) {
+    protocol_header_t resp;
 
-    printf("[Server] Received packet: OP=%d, Key='%s', Val='%s'\n",
-           header.opcode, (key != NULL) ? key : "(none)",
-           (value != NULL) ? value : "(none)");
-
-    // Save original lengths before the switch overwrites the header
-    uint32_t orig_key_len = header.key_len;
-    uint32_t orig_val_len = header.val_len;
-
-    switch (header.opcode) {
+    switch (c->header.opcode) {
     case OP_SET:
-      client_execute_set(db, key, value);
-      // Reuse the header struct for the response
-      header.opcode = OP_OK;
-      header.key_len = 0;
-      header.val_len = 0;
-      send(client_fd, &header, sizeof(protocol_header_t), 0);
+      client_execute_set(db, c->key, c->value);
+      resp.opcode = OP_OK;
+      resp.key_len = 0;
+      resp.val_len = 0;
+      send(c->fd, &resp, sizeof(protocol_header_t), 0);
       break;
     case OP_GET: {
-      char *result = hashmap_get(db, key);
-
+      char *result = hashmap_get(db, c->key);
       if (!result) {
-        header.opcode = OP_NULL;
-        header.key_len = 0;
-        header.val_len = 0;
-        send(client_fd, &header, sizeof(protocol_header_t), 0);
-        break;
+        resp.opcode = OP_NULL;
+        resp.key_len = 0;
+        resp.val_len = 0;
+        send(c->fd, &resp, sizeof(protocol_header_t), 0);
+      } else {
+        resp.opcode = OP_OK;
+        resp.key_len = 0;
+        resp.val_len = strlen(result);
+        send(c->fd, &resp, sizeof(protocol_header_t), 0);
+        send(c->fd, result, resp.val_len, 0);
+        free(result);
       }
-
-      header.opcode = OP_OK;
-      header.key_len = 0;
-      header.val_len = strlen(result);
-
-      send(client_fd, &header, sizeof(protocol_header_t), 0);
-      send(client_fd, result, header.val_len, 0);
-      free(result);
       break;
     }
     case OP_DEL:
-      client_execute_del(db, key);
-
-      header.opcode = OP_OK;
-      header.key_len = 0;
-      header.val_len = 0;
-
-      send(client_fd, &header, sizeof(protocol_header_t), 0);
+      client_execute_del(db, c->key);
+      resp.opcode = OP_OK;
+      resp.key_len = 0;
+      resp.val_len = 0;
+      send(c->fd, &resp, sizeof(protocol_header_t), 0);
       break;
     case OP_SAVE:
       checkpoint_database(db, "data/dump.txt");
-
-      header.opcode = OP_OK;
-      header.key_len = 0;
-      header.val_len = 0;
-
-      send(client_fd, &header, sizeof(protocol_header_t), 0);
-
+      resp.opcode = OP_OK;
+      resp.key_len = 0;
+      resp.val_len = 0;
+      send(c->fd, &resp, sizeof(protocol_header_t), 0);
       break;
     }
 
-    // Free using original values, they have been swapped for the response.
-    if (orig_key_len > 0)
-      free(key);
-    if (orig_val_len > 0)
-      free(value);
-    key = NULL;
-    value = NULL;
+    // Reset for the next command
+    if (c->key) {
+      free(c->key);
+      c->key = NULL;
+    }
+    if (c->value) {
+      free(c->value);
+      c->value = NULL;
+    }
+    c->state = STATE_HEADER;
+    c->bytes_read = 0;
   }
-
-  close(client_fd);
-  return NULL;
 }
 
 void server_start(int port, hashmap_t *db) {
@@ -174,42 +179,53 @@ void server_start(int port, hashmap_t *db) {
 
   printf("Server listening on port %d\n", port);
 
-  // Main accept loop. Blocks on accept() waiting for new clients.
-  // For each one, we spawn a dedicated thread.
+  int kq = kqueue();
+
+  struct kevent change;
+  EV_SET(&change, server_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+  kevent(kq, &change, 1, NULL, 0, NULL);
+  EV_SET(&change, 1, EVFILT_TIMER, EV_ADD, NOTE_SECONDS, 30, NULL);
+  kevent(kq, &change, 1, NULL, 0, NULL);
+
+  struct kevent events[64];
+  // Event loop: kevent() sleeps until a socket has data, a new client
+  // connects, or the autosave timer fires. Single-threaded, zero locks.
   while (keep_running) {
-    struct sockaddr_in client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    int client_fd =
-        accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+    int n = kevent(kq, NULL, 0, events, 64, NULL);
 
-    if (client_fd < 0) {
-      // If we got interrupted by a signal (SIGINT), just exit cleanly
-      if (!keep_running) {
-        break;
+    for (int i = 0; i < n; i++) {
+      if ((int)events[i].ident == server_fd) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd =
+            accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        client_t *client = malloc(sizeof(client_t));
+        client->fd = client_fd;
+        client->state = STATE_HEADER;
+        client->bytes_read = 0;
+        client->key = NULL;
+        client->value = NULL;
+        set_nonblocking(client_fd);
+        EV_SET(&change, client_fd, EVFILT_READ, EV_ADD, 0, 0, client);
+        kevent(kq, &change, 1, NULL, 0, NULL);
+        printf("New client connected\n");
+      } else if (events[i].filter == EVFILT_TIMER) {
+        bgsave_database(db, "data/dump.txt", "data/wal.log");
+      } else {
+        client_t *c = (client_t *)events[i].udata;
+        if (events[i].flags & EV_EOF) {
+          printf("Client disconnected\n");
+          close(c->fd);
+          if (c->key)
+            free(c->key);
+          if (c->value)
+            free(c->value);
+          free(c);
+        } else {
+          handle_client(c, db);
+        }
       }
-
-      perror("accept");
-      continue;
     }
-
-    printf("New client connected\n");
-
-    // Heap-allocate args so the thread can read them safely
-    // even after we loop back to accept the next client
-    client_args_t *args = malloc(sizeof(client_args_t));
-    args->client_fd = client_fd;
-    args->db = db;
-
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, client_handler, args) != 0) {
-      perror("pthread_create");
-      close(client_fd);
-      free(args);
-      continue;
-    }
-
-    // Detach so we don't have to join each thread manually
-    pthread_detach(tid);
   }
 
   close(server_fd);

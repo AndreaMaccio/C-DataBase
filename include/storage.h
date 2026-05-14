@@ -16,4 +16,6 @@ int storage_replay_wal(hashmap_t *map);
 int bgsave_database(hashmap_t *map, const char *snapshot_file,
                     const char *wal_path);
 
+void bgsave_finalize(void);
+
 #endif
